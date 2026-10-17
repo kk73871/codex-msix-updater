@@ -6,9 +6,10 @@
 
 普通用户不需要阅读源码，也不需要手动输入 PowerShell 命令：
 
-1. 打开 GitHub 项目的 **Releases** 页面，下载最新的 `CodexMsixUpdater-portable.zip`。
-2. 将 ZIP 解压到任意文件夹。
-3. 双击 `src\Start-CodexMsixUpdater.vbs`，在界面中点击“检查并安装”。
+1. 打开 GitHub 项目的 **Releases** 页面，下载最新的 `CodexMsixUpdater.exe`。
+2. 双击 EXE，在界面中点击“检查并安装”。
+
+如果 Windows 弹出来源确认，请选择允许运行。普通用户不需要安装 PowerShell，也不需要手动解压 ZIP。
 
 更新前请先完全退出 Codex。工具不会强制关闭 Codex，也不会删除其他安装包。
 
@@ -20,10 +21,11 @@
 
 Release 页面提供：
 
-- `CodexMsixUpdater-portable.zip`：普通用户使用的便携版程序。
-- `CodexMsixUpdater-portable.zip.sha256`：ZIP 的 SHA-256 校验值。
+- `CodexMsixUpdater.exe`：普通用户直接双击使用的单文件启动程序。
+- `CodexMsixUpdater-portable.zip`：包含源码入口、配置和备用启动器的完整便携包。
+- `CodexMsixUpdater-portable.zip.sha256`：便携 ZIP 的 SHA-256 校验值。
 
-GitHub 自动生成的 **Source code (zip)** 是源码快照，适合查看和二次开发，不是普通用户的首选下载包。
+GitHub 自动生成的 **Source code (zip)** 是源码快照，适合查看和二次开发；普通用户直接下载 EXE 即可。
 
 ## 开发者
 
@@ -60,6 +62,6 @@ pwsh -NoProfile -File .\build-release.ps1
 
 ## 发布流程
 
-维护者完成测试后创建版本标签，例如 `v1.0.0` 并推送到 GitHub。`.github/workflows/release.yml` 会重新运行测试、构建便携 ZIP、生成校验文件，并把它们上传到同名 GitHub Release。不要把近 1 GB 的真实 MSIX、日志、临时图片或个人机器配置提交到仓库。
+维护者完成测试后创建版本标签，例如 `v1.1.0` 并推送到 GitHub。`.github/workflows/release.yml` 会重新运行测试、构建单文件 EXE 和便携 ZIP、生成校验文件，并把它们上传到同名 GitHub Release。不要把近 1 GB 的真实 MSIX、日志、临时图片或个人机器配置提交到仓库。
 
 贡献代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；发现安全问题请阅读 [SECURITY.md](SECURITY.md)。

@@ -35,7 +35,7 @@ jobs:
             gh release create $tag --title $tag --generate-notes
             if ($LASTEXITCODE -ne 0) { throw '无法创建 GitHub Release。' }
           }
-          gh release upload $tag .\dist\CodexMsixUpdater-portable.zip .\dist\CodexMsixUpdater-portable.zip.sha256 --clobber
+          gh release upload $tag .\dist\CodexMsixUpdater.exe .\dist\CodexMsixUpdater-portable.zip .\dist\CodexMsixUpdater-portable.zip.sha256 --clobber
           if ($LASTEXITCODE -ne 0) { throw '无法上传 Release 文件。' }
 
       - name: Upload build artifact
@@ -43,5 +43,6 @@ jobs:
         with:
           name: CodexMsixUpdater-portable
           path: |
+            dist/CodexMsixUpdater.exe
             dist/CodexMsixUpdater-portable.zip
             dist/CodexMsixUpdater-portable.zip.sha256
