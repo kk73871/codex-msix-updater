@@ -1,0 +1,47 @@
+name: Build and publish release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run validation tests
+        shell: powershell
+        run: .\tests\Test-CodexMsixUpdater.ps1
+
+      - name: Build portable package
+        shell: pwsh
+        run: .\build-release.ps1
+
+      - name: Publish tagged release
+        if: startsWith(github.ref, 'refs/tags/')
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title $tag --generate-notes
+            if ($LASTEXITCODE -ne 0) { throw '无法创建 GitHub Release。' }
+          }
+          gh release upload $tag .\dist\CodexMsixUpdater-portable.zip .\dist\CodexMsixUpdater-portable.zip.sha256 --clobber
+          if ($LASTEXITCODE -ne 0) { throw '无法上传 Release 文件。' }
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: CodexMsixUpdater-portable
+          path: |
+            dist/CodexMsixUpdater-portable.zip
+            dist/CodexMsixUpdater-portable.zip.sha256

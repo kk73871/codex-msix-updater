@@ -1,0 +1,6 @@
+# Never commit downloaded MSIX packages or local logs.
+*.msix
+*.msix.download
+*.log
+packages/
+dist/

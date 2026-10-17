@@ -1,0 +1,14 @@
+name: Windows validation
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  powershell-5-1:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run static and isolated worker checks
+        shell: powershell
+        run: .\tests\Test-CodexMsixUpdater.ps1
