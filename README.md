@@ -19,13 +19,11 @@
 
 ## 下载与校验
 
-Release 页面提供：
+Release 页面只手动上传一个文件：
 
 - `CodexMsixUpdater.exe`：普通用户直接双击使用的单文件启动程序。
-- `CodexMsixUpdater-portable.zip`：包含源码入口、配置和备用启动器的完整便携包。
-- `CodexMsixUpdater-portable.zip.sha256`：便携 ZIP 的 SHA-256 校验值。
 
-GitHub 自动生成的 **Source code (zip)** 是源码快照，适合查看和二次开发；普通用户直接下载 EXE 即可。
+开发者可使用 GitHub 自动生成的 **Source code (zip)** 或 **Source code (tar.gz)** 查看和二次开发；普通用户只需下载 EXE。GitHub 会自动在每个 Release 下显示这两个源码快照。
 
 ## 开发者
 
@@ -37,7 +35,7 @@ GitHub 自动生成的 **Source code (zip)** 是源码快照，适合查看和�
 | `config/` | 产品 ID、包身份和查询地址等配置 |
 | `tests/` | 不执行真实安装的静态检查和隔离工作线程测试 |
 | `.github/workflows/` | GitHub Actions 自动验证和标签发布流程 |
-| `build-release.ps1` | 生成便携 ZIP 和 SHA-256 文件 |
+| `build-release.ps1` | 生成单文件 EXE |
 | `LICENSE` | 开源许可 |
 
 本地检查：
@@ -62,6 +60,6 @@ pwsh -NoProfile -File .\build-release.ps1
 
 ## 发布流程
 
-维护者完成测试后创建版本标签，例如 `v1.1.0` 并推送到 GitHub。`.github/workflows/release.yml` 会重新运行测试、构建单文件 EXE 和便携 ZIP、生成校验文件，并把它们上传到同名 GitHub Release。不要把近 1 GB 的真实 MSIX、日志、临时图片或个人机器配置提交到仓库。
+项目只维护一个 `v1.0.0` Release。维护者更新源码后，将 `v1.0.0` 标签移动到新提交并推送；`.github/workflows/release.yml` 会重新运行测试、构建 EXE、清理其他手动上传的 Release 文件，并只上传 `CodexMsixUpdater.exe`。GitHub 自动生成的 ZIP 和 TAR.GZ 源码快照仍由平台提供。不要把近 1 GB 的真实 MSIX、日志、临时图片或个人机器配置提交到仓库。
 
 贡献代码前请阅读 [CONTRIBUTING.md](CONTRIBUTING.md)；发现安全问题请阅读 [SECURITY.md](SECURITY.md)。
