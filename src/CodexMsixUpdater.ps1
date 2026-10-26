@@ -37,20 +37,30 @@ function Get-InstallFolder {
 
 function Get-Architecture {
     $arch = $null
-    try { $arch = [string][System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture } catch { }
+    # Use the native OS architecture so a 32-bit PowerShell process on x64/ARM64
+    # Windows cannot make us select an x86 package or reject a valid package.
+    try { $arch = [string][System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture } catch { }
+    if ([string]::IsNullOrWhiteSpace($arch)) { $arch = [string]$env:PROCESSOR_ARCHITEW6432 }
     if ([string]::IsNullOrWhiteSpace($arch)) { $arch = [string]$env:PROCESSOR_ARCHITECTURE }
     switch ($arch.ToUpperInvariant()) {
         'X64' { return 'x64' }
         'AMD64' { return 'x64' }
         'ARM64' { return 'arm64' }
-        default { throw "此工具支持 Windows x64 和 ARM64；当前架构为 $arch。" }
+        default { throw "此工具支持 Windows x64 和 ARM64；当前 Windows 架构为 $arch。" }
+    }
+}
+
+function Assert-SupportedWindows {
+    $version = [Environment]::OSVersion.Version
+    if ($version.Major -lt 10 -or ($version.Major -eq 10 -and $version.Build -lt 19041)) {
+        throw "当前 Windows 版本为 $($version.ToString())。官方 Codex MSIX 要求 Windows 10 版本 2004（build 19041）或更高版本；Windows 7 不兼容。"
     }
 }
 
 function Get-UserAgent { return 'CodexMsixUpdater/1.0 (Windows)' }
 function Write-QueueMessage { param($Queue,[string]$Kind,[string]$Text,[int64]$Done=0,[int64]$Total=0); $Queue.Enqueue([pscustomobject]@{Kind=$Kind;Text=$Text;Done=$Done;Total=$Total}) }
 function Test-DeliveryHost { param([Uri]$Uri); return ($Uri.Host -eq $Config.downloadHostSuffix -or $Uri.Host.EndsWith('.' + $Config.downloadHostSuffix)) }
-function Test-DownloadHost { param([Uri]$Uri); return ($Uri.Scheme -eq 'https' -and (Test-DeliveryHost $Uri)) }
+function Test-DownloadHost { param([Uri]$Uri); return ($Uri.Scheme -in @('https','http') -and (Test-DeliveryHost $Uri)) }
 
 function Get-OfficialStoreLinks {
     param([string]$Ring,$Queue)
@@ -69,8 +79,7 @@ function Get-OfficialStoreLinks {
         $vm=[regex]::Match($fileName,"^${escapedName}_(?<version>\d+(?:\.\d+){1,3})_${escapedArch}__[a-z0-9]+\.msix$",[Text.RegularExpressions.RegexOptions]::IgnoreCase)
         if (-not $vm.Success) { continue }
         $v=$null; if (-not [Version]::TryParse($vm.Groups['version'].Value,[ref]$v)) { continue }
-        $secureUri=[UriBuilder]$uri; $secureUri.Scheme='https'; $secureUri.Port=-1
-        $links.Add([pscustomobject]@{FileName=$fileName;Url=$secureUri.Uri.AbsoluteUri;Version=$v;Ring=$Ring;Architecture=$arch})
+        $links.Add([pscustomobject]@{FileName=$fileName;Url=$uri.AbsoluteUri;Version=$v;Ring=$Ring;Architecture=$arch})
     }
     return $links
 }
@@ -117,27 +126,62 @@ function Find-CachedCodexPackage {
 
 function Download-VerifiedFile {
     param([string]$Url,[string]$Path,$Queue)
-    $current=$Url
-    for ($i=0;$i -lt 5;$i++) {
-        $u=[Uri]$current; if (-not (Test-DownloadHost $u)) { throw '下载地址或重定向不在微软 delivery.mp.microsoft.com HTTPS 边界内。' }
-        $req=[Net.HttpWebRequest]::Create($u); $req.Method='GET'; $req.UserAgent=(Get-UserAgent); $req.AllowAutoRedirect=$false; $req.Timeout=30000; $req.ReadWriteTimeout=30000
-        $res=$req.GetResponse()
-        if ([int]$res.StatusCode -ge 300 -and [int]$res.StatusCode -lt 400) { $next=$res.Headers['Location']; $res.Dispose(); if ([string]::IsNullOrWhiteSpace($next)) { throw '微软下载重定向缺少 Location。' }; $current=([Uri]::new($u,$next)).AbsoluteUri; continue }
-        if ([int]$res.StatusCode -ne 200) { $res.Dispose(); throw "下载响应状态异常：$([int]$res.StatusCode)。" }
-        $total=$res.ContentLength; $tmp="$Path.download"; $input=$null; $output=$null
-        try { $input=$res.GetResponseStream(); $output=[IO.File]::Open($tmp,[IO.FileMode]::CreateNew); $buf=New-Object byte[] (1024*128); [int64]$done=0; $clock=[Diagnostics.Stopwatch]::StartNew(); [int64]$last=0; do { $n=$input.Read($buf,0,$buf.Length); if ($n -gt 0) { $output.Write($buf,0,$n); $done += $n; if ($clock.ElapsedMilliseconds-$last -ge 150) { Write-QueueMessage $Queue 'progress' '正在下载官方 MSIX…' $done $total; $last=$clock.ElapsedMilliseconds } } } while ($n -gt 0); if ($total -gt 0 -and $done -ne $total) { throw '下载长度与微软服务器声明不符，请重试。' }; $output.Dispose(); $output=$null; $input.Dispose(); $input=$null; $res.Dispose(); Move-Item -LiteralPath $tmp -Destination $Path; return } catch { if ($output) {$output.Dispose()}; if ($input) {$input.Dispose()}; $res.Dispose(); if (Test-Path -LiteralPath $tmp) { Remove-Item -LiteralPath $tmp -Force }; throw }
+    $current=[Uri]$Url
+    $tmp="$Path.download"
+    try {
+        for ($redirect=0; $redirect -lt 6; $redirect++) {
+            if (-not (Test-DownloadHost $current)) { throw '微软清单提供的下载地址或重定向地址无效。' }
+            $request=[Net.HttpWebRequest]::Create($current)
+            $request.Method='GET'; $request.UserAgent=Get-UserAgent; $request.AllowAutoRedirect=$false
+            $request.Timeout=30000; $request.ReadWriteTimeout=30000
+            $response=$null; $input=$null; $output=$null
+            try {
+                $response=$request.GetResponse()
+                $status=[int]$response.StatusCode
+                if ($status -ge 300 -and $status -lt 400) {
+                    $location=$response.Headers['Location']
+                    if ([string]::IsNullOrWhiteSpace($location)) { throw '微软下载重定向缺少目标地址。' }
+                    $current=[Uri]::new($current,$location)
+                    continue
+                }
+                if ($status -ne 200) { throw "下载响应状态异常：$status。" }
+                Write-QueueMessage $Queue 'progress' '正在下载官方 MSIX…' 0 $response.ContentLength
+                $input=$response.GetResponseStream()
+                $output=[IO.File]::Open($tmp,[IO.FileMode]::Create,[IO.FileAccess]::Write,[IO.FileShare]::None)
+                $buffer=New-Object byte[] (128KB); [int64]$done=0; [int64]$total=$response.ContentLength
+                $clock=[Diagnostics.Stopwatch]::StartNew(); [int64]$last=-1
+                while (($read=$input.Read($buffer,0,$buffer.Length)) -gt 0) {
+                    $output.Write($buffer,0,$read); $done += $read
+                    if ($clock.ElapsedMilliseconds -ge ($last + 120)) {
+                        Write-QueueMessage $Queue 'progress' '正在下载官方 MSIX…' $done $total
+                        $last=$clock.ElapsedMilliseconds
+                    }
+                }
+                $output.Flush(); $output.Dispose(); $output=$null
+                if ($total -gt 0 -and $done -ne $total) { throw "下载长度不完整：已收到 $done / $total 字节。" }
+                Write-QueueMessage $Queue 'progress' '正在下载官方 MSIX…' $done $total
+                Move-Item -LiteralPath $tmp -Destination $Path -Force -ErrorAction Stop
+                return
+            } finally {
+                if ($output) { $output.Dispose() }; if ($input) { $input.Dispose() }; if ($response) { $response.Dispose() }
+            }
+        }
+        throw '微软下载重定向次数过多。'
+    } catch {
+        Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue
+        throw
     }
-    throw '微软下载重定向次数过多。'
 }
 
 function Invoke-InstallPackage {
     param([string]$Path)
-    Add-AppxPackage -Path $Path -ErrorAction Stop
+    # Target only Codex; do not close apps using shared dependencies.
+    Add-AppxPackage -Path $Path -ForceTargetApplicationShutdown -ErrorAction Stop
 }
-
 function Invoke-Worker {
     param($Queue,$DoCheckOnly,$DeleteAfterInstall)
     try {
+        Assert-SupportedWindows
         if (-not (Get-Command -Name 'Get-AppxPackage' -ErrorAction SilentlyContinue)) { throw '当前 Windows 环境缺少 AppX 模块（Get-AppxPackage）；无法读取 Codex 安装状态。' }
         if (-not $DoCheckOnly -and -not (Get-Command -Name 'Add-AppxPackage' -ErrorAction SilentlyContinue)) { throw '当前 Windows 环境缺少 Add-AppxPackage；无法用 MSIX 更新 Codex。' }
         if (-not $DoCheckOnly) { $script:LogPath=Join-Path ([IO.Path]::GetTempPath()) ('CodexMsixUpdater-'+[Guid]::NewGuid().ToString('N')+'.log'); [IO.File]::WriteAllText($script:LogPath,"Codex 安装 / 更新日志`r`n",[Text.Encoding]::UTF8) }
@@ -145,11 +189,11 @@ function Invoke-Worker {
         $Queue.Enqueue([pscustomobject]@{Kind='result';InstalledVersion=[string]$installedVersion;AvailableVersion=[string]$candidate.Version;FileName=$candidate.FileName;Architecture=$candidate.Architecture;IsCurrent=[bool]($installedVersion -and $installedVersion -ge $candidate.Version)})
         if ($DoCheckOnly) { return }
         if ($installedVersion -and $installedVersion -ge $candidate.Version) { if ($script:LogPath){Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction SilentlyContinue}; Write-QueueMessage $Queue 'done' '已是最新版本，无需下载；未删除任何安装包。'; return }
-        if (@(Get-Process -Name Codex -ErrorAction SilentlyContinue).Count -gt 0) { throw '检测到 Codex 正在运行，请先关闭后再重试。' }
         $target=Find-CachedCodexPackage -Version $candidate.Version
         if (-not $target) { $target=Join-Path (Get-InstallFolder) ([IO.Path]::GetFileNameWithoutExtension($candidate.FileName)+'-'+[Guid]::NewGuid().ToString('N').Substring(0,8)+'.msix'); Download-VerifiedFile $candidate.Url $target $Queue } else { Write-QueueMessage $Queue 'log' '找到匹配版本的本地安装包，将直接复用。' }
+        Write-QueueMessage $Queue 'verify' '正在校验安装包…'
         $manifest=Read-CodexManifest $target; if ($manifest.Version -ne $candidate.Version) { throw '安装包清单版本与查询结果不一致，停止安装。' }
-        if (@(Get-Process -Name Codex -ErrorAction SilentlyContinue).Count -gt 0) { throw '检测到 Codex 正在运行，请先关闭后再重试。' }
+        Write-QueueMessage $Queue 'install' 'Windows 正在安装；会自动关闭占用的 Codex。'
         Invoke-InstallPackage $target
         $after=@(Get-InstalledCodex); if ($after.Count -eq 0 -or [Version]$after[0].Version -lt $manifest.Version -or $after[0].Publisher -ne $Config.publisher -or $after[0].PackageFamilyName -ne $Config.packageFamilyName) { throw '安装命令返回后，未能读回目标版本和官方身份。' }
         if ($script:LogPath){Remove-Item -LiteralPath $script:LogPath -Force -ErrorAction SilentlyContinue}
@@ -179,7 +223,7 @@ $state=New-Object Windows.Forms.Label; $state.Text='准备就绪'; $state.Locati
 $detail=New-Object Windows.Forms.Label; $detail.Text='点击“检查并安装”，工具会自动完成检查、下载和安装。'; $detail.Location=New-Object Drawing.Point(52,51); $detail.AutoSize=$true; $detail.ForeColor=[Drawing.Color]::FromArgb(86,101,122); $statusCard.Controls.Add($detail)
 $stepCard=New-Object Windows.Forms.Panel; $stepCard.Location=New-Object Drawing.Point(24,256); $stepCard.Size=New-Object Drawing.Size(328,132); $stepCard.BackColor=[Drawing.Color]::White; $stepCard.BorderStyle='FixedSingle'; $form.Controls.Add($stepCard)
 $stepTitle=New-Object Windows.Forms.Label; $stepTitle.Text='怎么使用'; $stepTitle.Location=New-Object Drawing.Point(18,14); $stepTitle.AutoSize=$true; $stepTitle.Font=New-Object Drawing.Font('Segoe UI Semibold',11); $stepTitle.ForeColor=[Drawing.Color]::FromArgb(25,42,70); $stepCard.Controls.Add($stepTitle)
-$stepText=New-Object Windows.Forms.Label; $stepText.Text=('1. 先完全退出 Codex' + [Environment]::NewLine + '2. 点击下方按钮' + [Environment]::NewLine + '3. 等待出现“更新完成”'); $stepText.Location=New-Object Drawing.Point(18,43); $stepText.AutoSize=$true; $stepText.ForeColor=[Drawing.Color]::FromArgb(86,101,122); $stepCard.Controls.Add($stepText)
+$stepText=New-Object Windows.Forms.Label; $stepText.Text=('1. 保存 Codex 中的工作' + [Environment]::NewLine + '2. 点击“检查并安装”' + [Environment]::NewLine + '3. 自动退出 Codex 并完成更新'); $stepText.Location=New-Object Drawing.Point(18,43); $stepText.AutoSize=$true; $stepText.ForeColor=[Drawing.Color]::FromArgb(86,101,122); $stepCard.Controls.Add($stepText)
 $settingCard=New-Object Windows.Forms.Panel; $settingCard.Location=New-Object Drawing.Point(368,256); $settingCard.Size=New-Object Drawing.Size(328,132); $settingCard.BackColor=[Drawing.Color]::White; $settingCard.BorderStyle='FixedSingle'; $form.Controls.Add($settingCard)
 $settingTitle=New-Object Windows.Forms.Label; $settingTitle.Text='更新设置'; $settingTitle.Location=New-Object Drawing.Point(18,14); $settingTitle.AutoSize=$true; $settingTitle.Font=New-Object Drawing.Font('Segoe UI Semibold',11); $settingTitle.ForeColor=[Drawing.Color]::FromArgb(25,42,70); $settingCard.Controls.Add($settingTitle)
 $deleteCheck=New-Object Windows.Forms.CheckBox; $deleteCheck.Text='成功后删除本次安装包'; $deleteCheck.Location=New-Object Drawing.Point(18,46); $deleteCheck.AutoSize=$true; $deleteCheck.Checked=$true; $deleteCheck.ForeColor=[Drawing.Color]::FromArgb(55,68,88); $settingCard.Controls.Add($deleteCheck)
@@ -191,14 +235,62 @@ $log=New-Object Windows.Forms.RichTextBox; $log.Location=New-Object Drawing.Poin
 $queue=[Collections.Concurrent.ConcurrentQueue[object]]::new(); $script:ps=$null; $script:async=$null
 function Start-Work {
     if ($script:ps) { return }
-    $button.Enabled=$false; $deleteCheck.Enabled=$false; $bar.Visible=$true; $log.Clear(); $state.Text='正在检查…'; $statusDot.BackColor=[Drawing.Color]::FromArgb(245,166,35); $detail.Text='正在查询官方版本，请稍候。'; $hint.Text='请保持窗口打开，工具正在工作…'
+    $button.Enabled=$false; $deleteCheck.Enabled=$false; $bar.Value=0; $bar.Style='Marquee'; $bar.Visible=$true; $log.Clear(); $state.Text='正在检查…'; $statusDot.BackColor=[Drawing.Color]::FromArgb(245,166,35); $detail.Text='正在查询官方版本，请稍候。'; $hint.Text='安装时会自动退出 Codex，请先保存工作。'
     $script:ps=[PowerShell]::Create()
-    $names=@('Get-InstallFolder','Write-QueueMessage','Get-Architecture','Get-UserAgent','Test-DeliveryHost','Test-DownloadHost','Get-OfficialStoreLinks','Find-CodexPackage','Get-InstalledCodex','Read-CodexManifest','Find-CachedCodexPackage','Download-VerifiedFile','Invoke-InstallPackage','Invoke-Worker')
+    $names=@('Get-InstallFolder','Write-QueueMessage','Get-Architecture','Assert-SupportedWindows','Get-UserAgent','Test-DeliveryHost','Test-DownloadHost','Get-OfficialStoreLinks','Find-CodexPackage','Get-InstalledCodex','Read-CodexManifest','Find-CachedCodexPackage','Download-VerifiedFile','Invoke-InstallPackage','Invoke-Worker')
     $defs=ConvertTo-WorkerDefinitions -Names $names
     [void]$script:ps.AddScript(($defs -join "`n"))
     $script:ps.Runspace.SessionStateProxy.SetVariable('Config',$script:Config)
     [void]$script:ps.AddScript('Invoke-Worker $args[0] $args[1] $args[2]').AddArgument($queue).AddArgument([bool]$CheckOnly).AddArgument([bool]$deleteCheck.Checked)
     $script:async=$script:ps.BeginInvoke()
 }
-$button.Add_Click({Start-Work}); $folder.Add_LinkClicked({Start-Process explorer.exe -ArgumentList ('"{0}"' -f (Get-InstallFolder))}); $timer=New-Object Windows.Forms.Timer; $timer.Interval=120; $timer.Add_Tick({$item=$null;while($queue.TryDequeue([ref]$item)){if($item.Kind -eq 'progress' -and $item.Total -gt 0){$bar.Value=[Math]::Min(100,[Math]::Max(0,[int](100*$item.Done/$item.Total)));$detail.Text=("{0}  {1:N1} MB / {2:N1} MB" -f $item.Text,($item.Done/1MB),($item.Total/1MB));$hint.Text='正在下载官方安装包，请勿关闭窗口。'}elseif($item.Kind -eq 'log'){$log.AppendText("$($item.Text)`r`n");$detail.Text=$item.Text}elseif($item.Kind -eq 'done'){$state.Text='更新完成';$statusDot.BackColor=[Drawing.Color]::FromArgb(38,166,110);$detail.Text=$item.Text;$hint.Text='你现在可以打开 Codex 继续使用。';$bar.Visible=$false;$button.Enabled=$true;$deleteCheck.Enabled=$true}elseif($item.Kind -eq 'error'){$state.Text='更新未完成';$statusDot.BackColor=[Drawing.Color]::FromArgb(205,70,70);$detail.Text=$item.Text;$hint.Text='请根据提示处理后再次点击“检查并安装”。';$bar.Visible=$false;$button.Enabled=$true;$deleteCheck.Enabled=$true;[Windows.Forms.MessageBox]::Show($form,$item.Text,'Codex 更新','OK','Error')|Out-Null}}if($script:async -and $script:async.IsCompleted -and $script:ps){$script:ps.EndInvoke($script:async);$script:ps.Dispose();$script:ps=$null;$script:async=$null}});$timer.Start()
+function Update-WorkerMessage {
+    param($Item)
+    switch ($Item.Kind) {
+        'progress' {
+            $bar.Visible=$true
+            if ($Item.Total -gt 0) {
+                $percent=[int][Math]::Floor([Math]::Min(100.0,[Math]::Max(0.0,100.0*$Item.Done/$Item.Total)))
+                $bar.Style='Continuous'; $bar.Value=$percent
+                $state.Text="正在下载… $percent%"
+                $detail.Text=("已下载 {0:N1} MB / {1:N1} MB" -f ($Item.Done/1MB),($Item.Total/1MB))
+            } else {
+                $bar.Style='Marquee'; $state.Text='正在下载…'
+                $detail.Text=("已下载 {0:N1} MB（服务器未提供总大小）" -f ($Item.Done/1MB))
+            }
+            $hint.Text='正在下载官方安装包，请勿关闭窗口。'
+        }
+        'verify' {
+            $bar.Style='Marquee'; $state.Text='正在校验…'; $detail.Text=$Item.Text
+            $hint.Text='正在核对安装包版本和官方身份。'
+        }
+        'install' {
+            $bar.Style='Marquee'; $state.Text='正在安装…'; $detail.Text=$Item.Text
+            $hint.Text='安装结束后，即可重新打开 Codex。'
+        }
+        'log' { $log.AppendText("$($Item.Text)`r`n"); $detail.Text=$Item.Text }
+        'done' {
+            $state.Text='更新完成'; $statusDot.BackColor=[Drawing.Color]::FromArgb(38,166,110)
+            $detail.Text=$Item.Text; $hint.Text='你现在可以打开 Codex 继续使用。'
+            $bar.Visible=$false; $button.Enabled=$true; $deleteCheck.Enabled=$true
+        }
+        'error' {
+            $state.Text='更新未完成'; $statusDot.BackColor=[Drawing.Color]::FromArgb(205,70,70)
+            $detail.Text=$Item.Text; $hint.Text='安装包会保留，可再次点击“检查并安装”。'
+            $bar.Visible=$false; $button.Enabled=$true; $deleteCheck.Enabled=$true
+            [Windows.Forms.MessageBox]::Show($form,$Item.Text,'Codex 更新','OK','Error')|Out-Null
+        }
+    }
+}
+$button.Add_Click({Start-Work})
+$folder.Add_LinkClicked({Start-Process explorer.exe -ArgumentList ('"{0}"' -f (Get-InstallFolder))})
+$timer=New-Object Windows.Forms.Timer; $timer.Interval=120
+$timer.Add_Tick({
+    $item=$null
+    while($queue.TryDequeue([ref]$item)){ Update-WorkerMessage $item }
+    if($script:async -and $script:async.IsCompleted -and $script:ps){
+        $script:ps.EndInvoke($script:async); $script:ps.Dispose(); $script:ps=$null; $script:async=$null
+    }
+})
+$timer.Start()
 if($PreviewPath){$form.Show();$form.Opacity=0;[Windows.Forms.Application]::DoEvents();$bmp=New-Object Drawing.Bitmap($form.Width,$form.Height);$form.DrawToBitmap($bmp,(New-Object Drawing.Rectangle(0,0,$form.Width,$form.Height)));$bmp.Save($PreviewPath,[Drawing.Imaging.ImageFormat]::Png);$bmp.Dispose();$form.Close();$timer.Stop();$form.Dispose();exit 0};[void]$form.ShowDialog();$timer.Stop();if($script:ps){$script:ps.Stop();$script:ps.Dispose()};$form.Dispose()

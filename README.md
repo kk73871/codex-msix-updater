@@ -11,11 +11,13 @@
 
 如果 Windows 弹出来源确认，请选择允许运行。普通用户不需要安装 PowerShell，也不需要手动解压 ZIP。
 
-更新前请先完全退出 Codex。工具不会强制关闭 Codex，也不会删除其他安装包。
+更新前请先保存 Codex 中的工作。下载时会显示百分比和已下载大小；服务器未提供总大小时，显示已下载大小和动态进度条。安装时由 Windows 自动关闭目标 Codex 应用包关联的进程，并继续安装，无需手动查找或结束后台进程；工具不会按进程名称关闭程序，也不会删除其他安装包。
 
 工具会把安装包缓存到 `%LOCALAPPDATA%\CodexMsixUpdater\packages`。勾选“安装成功后删除本次使用的安装包”后，只删除本次实际安装并完成版本回读的那一个 MSIX；最新版、下载失败、校验失败或安装失败时会保留文件。
 
-支持 Windows 10/11 x64 和 ARM64。需要系统自带 Windows PowerShell 5.1、AppX 安装能力，以及能够访问 `delivery.mp.microsoft.com` 的网络。
+支持 Windows 10（版本 2004 / build 19041 及更高版本）和 Windows 11 的 x64、ARM64 系统。工具按 Windows 原生架构选择 Codex MSIX，即使启动器落在 32 位 PowerShell 或 ARM64 的模拟环境中，也不会按进程架构误选安装包。需要系统自带 Windows PowerShell 5.1、AppX 安装能力，以及能够访问 `delivery.mp.microsoft.com` 的网络。
+
+Windows 7 不兼容。当前官方 Codex MSIX 的 `TargetDeviceFamily` 最低版本是 `Windows.Desktop 10.0.19041.0`；更新器会在查询前直接提示系统版本过低，不会下载或删除安装包。
 
 ## 下载与校验
 
@@ -56,7 +58,7 @@ PowerShell.exe -NoProfile -ExecutionPolicy Bypass -File .\tests\Test-CodexMsixUp
 pwsh -NoProfile -File .\build-release.ps1
 ```
 
-查询接口是第三方公开 Store 清单接口，项目不上传用户数据。接口或官方包身份发生变化时，应同步检查 `config/appsettings.json`、查询解析逻辑和测试，再发布新的 Release。
+查询接口是第三方公开 Store 清单接口，项目不上传用户数据。下载使用清单给出的微软 CDN 地址和协议，避免把 CDN 返回的 HTTP 地址强行改成证书名称不匹配的 HTTPS 地址；MSIX 签名和包身份仍由 Windows 安装器验证。接口或官方包身份发生变化时，应同步检查 `config/appsettings.json`、查询解析逻辑和测试，再发布新的 Release。
 
 ## 发布流程
 

@@ -10,6 +10,14 @@ if($errors.Count){throw ($errors | ForEach-Object Message | Out-String)}
 if((Get-Content (Join-Path $Root 'config\appsettings.json') -Raw -Encoding UTF8 | ConvertFrom-Json).packageName -ne 'OpenAI.Codex'){throw 'config packageName check failed'}
 $cmd=Get-Content (Join-Path $Root 'src\Start-CodexMsixUpdater.cmd') -Raw
 if($cmd -notmatch 'WindowsPowerShell\\v1\.0\\powershell\.exe'){throw 'launcher check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -notmatch 'RuntimeInformation\]::OSArchitecture'){throw 'OS architecture detection check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -notmatch 'build 19041'){throw 'minimum Windows build check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -notmatch "@\('https','http'\)"){throw 'Microsoft delivery HTTP/HTTPS handling check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -notmatch '\[Net\.HttpWebRequest\]::Create'){throw 'streaming download path check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -notmatch 'Write-QueueMessage \$Queue ''progress'''){throw 'download progress event check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -notmatch 'ForceTargetApplicationShutdown'){throw 'AppX force application shutdown check failed'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -match 'Get-Process\s+-Name\s+Codex'){throw 'Codex process precheck must not block installation'}
+if((Get-Content $scriptPath -Raw -Encoding UTF8) -match '\$secureUri\.Scheme\s*=\s*''https'''){throw 'Microsoft-advertised download scheme must not be silently rewritten'}
 
 $ast = [System.Management.Automation.Language.Parser]::ParseFile($scriptPath,[ref]$tokens,[ref]$errors)
 $workerFunction = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Worker' }, $true)
@@ -27,22 +35,24 @@ $mockFunctions = @'
 function Get-InstallFolder { return $TestRoot }
 function Write-QueueMessage { param($Queue,$Kind,$Text,$Done,$Total); $Queue.Enqueue([pscustomobject]@{Kind=$Kind;Text=$Text;Done=$Done;Total=$Total}) }
 function Get-Architecture { return 'x64' }
+function Assert-SupportedWindows { }
 function Get-UserAgent { return 'CodexMsixUpdater-test' }
 function Test-DeliveryHost { param([Uri]$Uri); return $Uri.Host.EndsWith('delivery.mp.microsoft.com') }
-function Test-DownloadHost { param([Uri]$Uri); return $Uri.Scheme -eq 'https' }
+function Test-DownloadHost { param([Uri]$Uri); return $Uri.Scheme -in @('http','https') }
 function Get-OfficialStoreLinks { param($Ring,$Queue); return @() }
 function Find-CodexPackage { param($Queue); return [pscustomobject]@{Version=[Version]'2.0.0';FileName='OpenAI.Codex_2.0.0_x64__2p2nqsd0c76g0.msix';Architecture='x64';Url='https://example.invalid/package'} }
-function Get-InstalledCodex { if(-not $script:InstalledVersion){$script:InstalledVersion='1.0.0'}; return [pscustomobject]@{Version=$script:InstalledVersion;Publisher=$Config.publisher;PackageFamilyName=$Config.packageFamilyName} }
+function Get-InstalledCodex { $marker=Join-Path $TestRoot 'force-shutdown.txt'; $version=if(Test-Path -LiteralPath $marker){'2.0.0'}else{'1.0.0'}; return [pscustomobject]@{Version=$version;Publisher=$Config.publisher;PackageFamilyName=$Config.packageFamilyName} }
 function Find-CachedCodexPackage { param([Version]$Version); return $SelectedPath }
 function Read-CodexManifest { param([string]$Path); return [pscustomobject]@{Name='OpenAI.Codex';Architecture='x64';Publisher=$Config.publisher;Version=[Version]'2.0.0'} }
-function Invoke-InstallPackage { param([string]$Path); $script:InstalledPath=$Path; $script:InstalledVersion='2.0.0' }
 function Download-VerifiedFile { param([string]$Url,[string]$Path,$Queue); throw 'Network download is disabled in tests.' }
-function Add-AppxPackage { param([string]$Path); }
+function Add-AppxPackage { [CmdletBinding()] param([string]$Path,[switch]$ForceTargetApplicationShutdown); if($FailInstall){throw 'Controlled AppX failure'}; if($Path -ne $SelectedPath){throw 'Wrong installation path'}; [IO.File]::WriteAllText((Join-Path $TestRoot 'force-shutdown.txt'),([string][bool]$ForceTargetApplicationShutdown)); }
 function Get-AppxPackage { param([string]$Name); return @() }
 function Get-Process { [CmdletBinding()] param([string]$Name); return @() }
 '@
 $Config = [pscustomobject]@{ packageName='OpenAI.Codex'; publisher='Test publisher'; packageFamilyName='OpenAI.Codex_2p2nqsd0c76g0' }
 $TestRoot=$rootFolder;$SelectedPath=$selected
+$installerFunction=$ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-InstallPackage' }, $true)
+. ([ScriptBlock]::Create($installerFunction[0].Extent.Text))
 . ([ScriptBlock]::Create($mockFunctions))
 . ([ScriptBlock]::Create($workerFunction[0].Extent.Text))
 . ([ScriptBlock]::Create($converterFunction[0].Extent.Text))
@@ -58,7 +68,7 @@ try {
     $ps.Runspace.SessionStateProxy.SetVariable('SelectedPath',$selected)
     $ps.Runspace.SessionStateProxy.SetVariable('LogPath',$null)
     $q = [Collections.Concurrent.ConcurrentQueue[object]]::new()
-    [void]$ps.AddScript('$script:InstalledVersion="1.0.0";$script:InstalledPath=$null;Invoke-Worker $args[0] $false $true').AddArgument($q)
+    [void]$ps.AddScript('$global:InstalledVersion="1.0.0";$script:InstalledPath=$null;$global:InstallForceTargetApplicationShutdown=$false;Invoke-Worker $args[0] $false $true').AddArgument($q)
     [IO.File]::WriteAllText($selected,'selected');[IO.File]::WriteAllText($other,'other')
     [void]$ps.Invoke()
     if($ps.HadErrors){throw ('isolated worker error: '+($ps.Streams.Error -join '; '))}
@@ -67,25 +77,134 @@ try {
     if(Test-Path -LiteralPath $selected){throw 'selected package was not deleted'}
     if(-not (Test-Path -LiteralPath $other)){throw 'other package was deleted'}
     if(-not (($messages|Where-Object Kind -eq 'done').Text -match '已删除本次成功安装所用的安装包')){throw 'missing update success message'}
+    $forceMarker=Join-Path $rootFolder 'force-shutdown.txt'
+    if(-not (Test-Path -LiteralPath $forceMarker) -or (Get-Content -LiteralPath $forceMarker -Raw) -ne 'True'){throw 'install did not request AppX application shutdown'}
 
     $ps.Commands.Clear();$q=[Collections.Concurrent.ConcurrentQueue[object]]::new();$ps.Runspace.SessionStateProxy.SetVariable('LogPath',$null)
-    [void]$ps.AddScript('$script:InstalledVersion="2.0.0";Invoke-Worker $args[0] $false $true').AddArgument($q)
+    [void]$ps.AddScript('$global:InstalledVersion="2.0.0";Invoke-Worker $args[0] $false $true').AddArgument($q)
     [IO.File]::WriteAllText($selected,'selected')
     [void]$ps.Invoke()
     if($ps.HadErrors){throw ('current-version worker error: '+($ps.Streams.Error -join '; '))}
     if(-not (Test-Path -LiteralPath $selected) -or -not (Test-Path -LiteralPath $other)){throw 'current-version branch modified a package'}
 
     $ps.Commands.Clear();$q=[Collections.Concurrent.ConcurrentQueue[object]]::new()
-    [void]$ps.AddScript('$script:InstalledVersion="1.0.0";Invoke-Worker $args[0] $false $false').AddArgument($q)
+    $forceMarker=Join-Path $rootFolder 'force-shutdown.txt'; if(Test-Path -LiteralPath $forceMarker -PathType Leaf){[IO.File]::Delete($forceMarker)}
+    [void]$ps.AddScript('$global:InstalledVersion="1.0.0";Invoke-Worker $args[0] $false $false').AddArgument($q)
     [void]$ps.Invoke()
     if($ps.HadErrors){throw ('keep-package worker error: '+($ps.Streams.Error -join '; '))}
     if(-not (Test-Path -LiteralPath $selected) -or -not (Test-Path -LiteralPath $other)){throw 'unchecked delete option modified a package'}
-    Write-Output 'Windows PowerShell 5.1 GUI worker serialization passed; delete-one, current-version keep, and unchecked keep passed.'
+    $ps.Commands.Clear();$q=[Collections.Concurrent.ConcurrentQueue[object]]::new()
+    [IO.File]::Delete($forceMarker)
+    $ps.Runspace.SessionStateProxy.SetVariable('FailInstall',$true)
+    [void]$ps.AddScript('Invoke-Worker $args[0] $false $true').AddArgument($q)
+    [void]$ps.Invoke()
+    $messages=@($q)
+    if(@($messages | Where-Object Kind -eq 'error').Count -ne 1 -or $messages.Kind -contains 'done'){throw 'installation failure was reported as success'}
+    if(-not (Test-Path -LiteralPath $selected) -or -not (Test-Path -LiteralPath $other)){throw 'failed installation removed a package'}
+    Write-Output 'GUI worker passed: actual target-only AppX call, cache reuse, delete-one, keep, current version, and failure preservation.'
 }
 finally {
     $ps.Dispose()
     if(Test-Path -LiteralPath $selected -PathType Leaf){[IO.File]::Delete($selected)}
     if(Test-Path -LiteralPath $other -PathType Leaf){[IO.File]::Delete($other)}
+    $forceMarker=Join-Path $rootFolder 'force-shutdown.txt'; if(Test-Path -LiteralPath $forceMarker -PathType Leaf){[IO.File]::Delete($forceMarker)}
     if(Test-Path -LiteralPath $rootFolder -PathType Container){foreach($file in Get-ChildItem -LiteralPath $rootFolder -File -Filter 'Codex-failed-*.log' -ErrorAction SilentlyContinue){[IO.File]::Delete($file.FullName)};[IO.Directory]::Delete($rootFolder,$false)}
+}
+
+$downloadFunction = $ast.FindAll({ param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Download-VerifiedFile' }, $true)
+if($downloadFunction.Count -ne 1) { throw 'Download-VerifiedFile function not found.' }
+$downloadRoot = Join-Path ([IO.Path]::GetTempPath()) ('CodexMsixUpdater-download-test-' + [Guid]::NewGuid().ToString('N'))
+$listener = [Net.Sockets.TcpListener]::new([Net.IPAddress]::Loopback,0)
+$downloadPs = $null
+try {
+    New-Item -ItemType Directory -Path $downloadRoot | Out-Null
+    $listener.Start()
+    $port = ([Net.IPEndPoint]$listener.LocalEndpoint).Port
+    $payload = New-Object byte[] (1MB)
+    for($i=0;$i -lt $payload.Length;$i++){ $payload[$i]=[byte]($i % 251) }
+    $downloadMocks = @'
+function Get-UserAgent { return 'CodexMsixUpdater-test' }
+function Test-DownloadHost { param([Uri]$Uri); return $Uri.IsLoopback }
+function Write-QueueMessage { param($Queue,$Kind,$Text,$Done,$Total); $Queue.Enqueue([pscustomobject]@{Kind=$Kind;Text=$Text;Done=$Done;Total=$Total}) }
+'@
+    foreach($scenario in @('known-size','unknown-size','truncated')){
+        $downloadQueue = [Collections.Concurrent.ConcurrentQueue[object]]::new()
+        $downloadTarget = Join-Path $downloadRoot ($scenario+'.bin')
+        $downloadPs = [PowerShell]::Create()
+        [void]$downloadPs.AddScript($downloadFunction[0].Extent.Text + [Environment]::NewLine + $downloadMocks + [Environment]::NewLine + 'Download-VerifiedFile $args[0] $args[1] $args[2]').AddArgument("http://127.0.0.1:$port/package.msix").AddArgument($downloadTarget).AddArgument($downloadQueue)
+        $async = $downloadPs.BeginInvoke()
+        $accept=$listener.AcceptTcpClientAsync()
+        if(-not $accept.Wait(10000)){throw 'download client did not connect within 10 seconds'}
+        $client=$accept.GetAwaiter().GetResult()
+        try {
+            $stream = $client.GetStream(); $stream.ReadTimeout=10000; $stream.WriteTimeout=10000
+            $requestBuffer = New-Object byte[] 4096
+            [void]$stream.Read($requestBuffer,0,$requestBuffer.Length)
+            $lengthHeader=if($scenario -eq 'unknown-size'){''}else{"Content-Length: $($payload.Length)`r`n"}
+            $header = [Text.Encoding]::ASCII.GetBytes("HTTP/1.1 200 OK`r`n$($lengthHeader)Connection: close`r`n`r`n")
+            $stream.Write($header,0,$header.Length)
+            $sendLength=if($scenario -eq 'truncated'){$payload.Length/2}else{$payload.Length}
+            for($offset=0;$offset -lt $sendLength;$offset+=64KB){
+                $count=[Math]::Min(64KB,$sendLength-$offset)
+                $stream.Write($payload,$offset,$count); $stream.Flush()
+                Start-Sleep -Milliseconds 40
+            }
+            $during=@($downloadQueue | Where-Object {$_.Kind -eq 'progress' -and $_.Done -gt 0 -and $_.Done -lt $payload.Length})
+            if($scenario -ne 'truncated' -and $during.Count -eq 0){throw "no intermediate progress before server finished: $scenario"}
+            $stream.Dispose()
+        } finally { $client.Dispose() }
+        if(-not $async.AsyncWaitHandle.WaitOne(10000)){throw "download did not finish within 10 seconds: $scenario"}
+        $downloadFailure=$null
+        try { [void]$downloadPs.EndInvoke($async) } catch { $downloadFailure=$_ }
+        if($scenario -eq 'truncated'){
+            if(-not $downloadPs.HadErrors -and -not $downloadFailure){throw 'truncated download was accepted'}
+            if((Test-Path -LiteralPath $downloadTarget) -or (Test-Path -LiteralPath ($downloadTarget+'.download'))){throw 'truncated download left a usable or partial package'}
+        } else {
+            if($downloadFailure){throw $downloadFailure}
+            if($downloadPs.HadErrors){throw ('download replay error: '+($downloadPs.Streams.Error -join '; '))}
+            $actual=[IO.File]::ReadAllBytes($downloadTarget)
+            if(-not ([Linq.Enumerable]::SequenceEqual($actual,$payload))){throw "downloaded payload mismatch: $scenario"}
+            $progress=@($downloadQueue | Where-Object Kind -eq 'progress')
+            $expectedTotal=if($scenario -eq 'unknown-size'){-1}else{$payload.Length}
+            if($progress.Count -lt 2 -or $progress[-1].Done -ne $payload.Length -or $progress[-1].Total -ne $expectedTotal){throw "download progress completion mismatch: $scenario"}
+            [IO.File]::Delete($downloadTarget)
+        }
+        $downloadPs.Dispose(); $downloadPs=$null
+    }
+    Write-Output 'HTTP download replay passed: intermediate progress, known/unknown size, byte equality, and incomplete download rejection.'
+} finally {
+    if($downloadPs){$downloadPs.Stop();$downloadPs.Dispose()}
+    $listener.Stop()
+    foreach($name in @('known-size.bin','unknown-size.bin','truncated.bin','known-size.bin.download','unknown-size.bin.download','truncated.bin.download')){
+        $file=Join-Path $downloadRoot $name
+        if(Test-Path -LiteralPath $file -PathType Leaf){[IO.File]::Delete($file)}
+    }
+    if(Test-Path -LiteralPath $downloadRoot -PathType Container){[IO.Directory]::Delete($downloadRoot,$false)}
+}
+
+# Exercise the actual WinForms message consumer, not a duplicate formatting rule.
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+$uiFunction=$ast.FindAll({param($node) $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Update-WorkerMessage'},$true)
+. ([ScriptBlock]::Create($uiFunction[0].Extent.Text))
+$bar=New-Object Windows.Forms.ProgressBar
+$state=New-Object Windows.Forms.Label
+$detail=New-Object Windows.Forms.Label
+$hint=New-Object Windows.Forms.Label
+$statusDot=New-Object Windows.Forms.Panel
+$button=New-Object Windows.Forms.Button
+$deleteCheck=New-Object Windows.Forms.CheckBox
+try {
+    Update-WorkerMessage ([pscustomobject]@{Kind='progress';Done=3MB;Total=8MB})
+    if($bar.Value -ne 37 -or $state.Text -ne '正在下载… 37%' -or $bar.Style -ne 'Continuous'){throw ("known-size UI progress failed: value={0}; state={1}; style={2}" -f $bar.Value,$state.Text,$bar.Style)}
+    Update-WorkerMessage ([pscustomobject]@{Kind='progress';Done=3MB;Total=-1})
+    if($bar.Style -ne 'Marquee' -or $detail.Text -notmatch '服务器未提供总大小'){throw 'unknown-size UI progress failed'}
+    Update-WorkerMessage ([pscustomobject]@{Kind='install';Text='Windows 正在安装'})
+    if($state.Text -ne '正在安装…' -or $bar.Style -ne 'Marquee'){throw 'installation UI phase failed'}
+    Update-WorkerMessage ([pscustomobject]@{Kind='done';Text='已更新'})
+    if($state.Text -ne '更新完成' -or -not $button.Enabled){throw 'completion UI phase failed'}
+    Write-Output 'WinForms consumer passed: percentage, unknown length, installing, and completion.'
+} finally {
+    foreach($control in @($bar,$state,$detail,$hint,$statusDot,$button,$deleteCheck)){$control.Dispose()}
 }
 Write-Output 'Static checks passed.'
